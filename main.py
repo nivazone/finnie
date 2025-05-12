@@ -10,6 +10,9 @@ from openai import OpenAI
 from openai import OpenAIError
 from functools import partial
 import os
+import psycopg
+from datetime import datetime
+
 
 # ------------------------------------------------
 # State definition for LangGraph
@@ -122,6 +125,72 @@ def statement_parser(state: AgentState, llm_fn: Callable[[str], str]) -> AgentSt
     state["parsed_data"] = json.loads(llm_output.strip())
     return state
 
+def postgres_writer(state):
+    """
+    Writes parsed statement + transactions into Postgres using psycopg3.
+    Will raise exception on any error (including duplicate insert).
+    """
+    parsed = state["parsed_data"]
+    transactions = parsed.get("transactions", [])
+
+    # Extract statement fields
+    account_holder = parsed.get("account_holder")
+    account_name = parsed.get("account_name")
+    opening_balance = parsed.get("opening_balance")
+    closing_balance = parsed.get("closing_balance")
+    credit_limit = parsed.get("credit_limit")
+    interest_charged = parsed.get("interest_charged")
+
+    # Convert statement dates
+    start_date = datetime.strptime(parsed["start"], "%d/%m/%y").date()
+    end_date = datetime.strptime(parsed["end"], "%d/%m/%y").date()
+
+    # Connect to Postgres
+    conn_params = {
+        "host": os.getenv("POSTGRES_HOST", "localhost"),
+        "port": os.getenv("POSTGRES_PORT", "5432"),
+        "dbname": os.getenv("POSTGRES_DB"),
+        "user": os.getenv("POSTGRES_USER"),
+        "password": os.getenv("POSTGRES_PASSWORD"),
+    }
+
+    with psycopg.connect(**conn_params) as conn:
+        with conn.cursor() as cur:
+            # Insert statement
+            cur.execute("""
+                INSERT INTO statements
+                    (account_holder, account_name, start_date, end_date,
+                     opening_balance, closing_balance, credit_limit, interest_charged)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+            """, (
+                account_holder, account_name, start_date, end_date,
+                opening_balance, closing_balance, credit_limit, interest_charged
+            ))
+            statement_id = cur.fetchone()[0]
+
+            # Insert transactions
+            for tx in transactions:
+                tx_date_str = tx.get("date")
+                try:
+                    tx_date = datetime.strptime(f"{tx_date_str} {start_date.year}", "%b %d %Y").date()
+                except Exception:
+                    tx_date = None  # optional: log or ignore
+
+                tx_details = tx.get("transaction_details")
+                tx_amount = tx.get("amount")
+
+                cur.execute("""
+                    INSERT INTO transactions
+                        (statement_id, transaction_date, transaction_details, amount)
+                    VALUES (%s, %s, %s, %s);
+                """, (statement_id, tx_date, tx_details, tx_amount))
+
+        conn.commit()
+
+    return state
+
+
 # ------------------------------------------------
 # External LLM provider function (example: OpenAI)
 # ------------------------------------------------
@@ -155,13 +224,15 @@ if __name__ == "__main__":
     graph.add_node("pdf_extractor", pdf_extractor)
     graph.add_node("text_flattener", text_flattener)
     graph.add_node("statement_parser", partial(statement_parser, llm_fn=openai_llm))
+    graph.add_node("postgres_writer", postgres_writer)
 
     graph.add_edge(START, "pdf_extractor")
     graph.add_edge("pdf_extractor", "text_flattener")
     graph.add_edge("text_flattener", "statement_parser")
-    graph.add_edge("statement_parser", END)
+    graph.add_edge("statement_parser", "postgres_writer")
+    graph.add_edge("postgres_writer", END)
 
     pipeline = graph.compile()
     result = pipeline.invoke({"pdf_path": "statements/april-2025.pdf"})
-    print(json.dumps(result["parsed_data"], indent=2, ensure_ascii=False))
+    print("Pipeline completed. DB should be populated.")
 
