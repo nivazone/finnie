@@ -9,6 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from openai import OpenAI
 from openai import OpenAIError
 from functools import partial
+import os
 
 # ------------------------------------------------
 # State definition for LangGraph
@@ -135,9 +136,12 @@ def openai_llm(prompt: str) -> str:
         str: Text response from the LLM.
     """
 
-    client = OpenAI()
+    client = OpenAI(
+        base_url=os.getenv("OPENAI_BASE_URL", None),
+        api_key=os.getenv("OPENAI_API_KEY", "lm-studio")
+    )
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0
     )
