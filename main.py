@@ -2,22 +2,44 @@ from dotenv import load_dotenv
 import pdfplumber
 import json
 import logging
+from typing import TypedDict, Annotated, Dict, Callable
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+from langgraph.graph import StateGraph, START, END
 from openai import OpenAI
 from openai import OpenAIError
+from functools import partial
 
-def extract_text_from_pdf(file_path: str) -> dict:
+# ------------------------------------------------
+# State definition for LangGraph
+# ------------------------------------------------
+class AgentState(TypedDict):
     """
-    Extracts all possible information from PDF: text and tables per page.
-    
+    Defines the shared state used by all agents in the graph.
+    """
+
+    messages: Annotated[list[AnyMessage], add_messages]
+    pdf_path: str
+    extracted_data: dict
+    flattened_text: str
+    parsed_data: dict
+
+# ------------------------------------------------
+# Agent: PDF extractor
+# ------------------------------------------------
+def pdf_extractor(state: AgentState) -> AgentState:
+    """
+    Extracts all text and tables from a PDF file.
+
     Args:
-        file_path (str): Path to the PDF file.
+        state (AgentState): Graph state containing 'pdf_path'.
 
     Returns:
-        dict with page-wise data
+        AgentState: Updated state with 'extracted_data' containing extracted pages.
     """
 
+    file_path = state["pdf_path"]
     pages_data = []
-
     with pdfplumber.open(file_path) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             page_data = {
@@ -26,31 +48,50 @@ def extract_text_from_pdf(file_path: str) -> dict:
                 "tables": page.extract_tables() or []
             }
             pages_data.append(page_data)
+    state["extracted_data"] = {"pages": pages_data}
+    return state
 
-    return {"pages": pages_data}
+# ------------------------------------------------
+# Agent: Text flattener
+# ------------------------------------------------
+def text_flattener(state: AgentState) -> AgentState:
+    """
+    Flattens structured PDF data into a single text block for LLM input.
 
-def flatten_extracted_data(extracted_data: dict) -> str:
+    Args:
+        state (AgentState): Graph state with 'extracted_data' from pdf_extractor.
+
+    Returns:
+        AgentState: Updated state with 'flattened_text' ready for LLM consumption.
     """
-    Turns extracted_data into a single string for LLM input.
-    """
+    
+    extracted_data = state["extracted_data"]
     output = ""
-
     for page in extracted_data["pages"]:
         output += f"\n\n--- Page {page['page_number']} ---\n\n"
         output += page["text"] + "\n"
-    
         for table in page["tables"]:
             output += "\n[Table]\n"
             for row in table:
                 output += " | ".join(str(cell) for cell in row) + "\n"
-    
-    return output
+    state["flattened_text"] = output
+    return state
 
-def parse_statement_with_llm(extracted_data: dict) -> dict:
+# ------------------------------------------------
+# Agent: Statement parser
+# ------------------------------------------------
+def statement_parser(state: AgentState, llm_fn: Callable[[str], str]) -> AgentState:
     """
-    Sends extracted data to LLM to convert into structured bank statement info.
+    Calls an external LLM to parse flattened bank statement text into structured JSON.
+
+    Args:
+        state (AgentState): Graph state containing 'flattened_text'.
+        llm_fn (Callable[[str], str]): External function to call LLM with a prompt.
+
+    Returns:
+        AgentState: Updated state with 'parsed_data' containing structured account details.
     """
-    raw_text = flatten_extracted_data(extracted_data)
+    flattened_text = state["flattened_text"]
 
     system_prompt = (
         """
@@ -75,31 +116,48 @@ def parse_statement_with_llm(extracted_data: dict) -> dict:
         """
     )
 
+    full_prompt = f"{system_prompt}\n\n{flattened_text}"
+    llm_output = llm_fn(full_prompt)
+    state["parsed_data"] = json.loads(llm_output.strip())
+    return state
+
+# ------------------------------------------------
+# External LLM provider function (example: OpenAI)
+# ------------------------------------------------
+def openai_llm(prompt: str) -> str:
+    """
+    Calls OpenAI LLM to generate a response for a given prompt.
+
+    Args:
+        prompt (str): Prompt text to send to the model.
+
+    Returns:
+        str: Text response from the LLM.
+    """
+
     client = OpenAI()
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": raw_text}
-            ],
-            temperature=0.0
-        )
-        
-        llm_response = response.choices[0].message.content.strip()
-        
-        structured_data = json.loads(llm_response)
-        return structured_data
-    except OpenAIError as e:
-        print(f"OpenAI API error: {e}")
-        return {}
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0
+    )
+    return response.choices[0].message.content.strip()
 
 if __name__ == "__main__":
     load_dotenv()
     logging.getLogger("pdfminer").setLevel(logging.ERROR)
     
-    extracted = extract_text_from_pdf("statements/april-2025.pdf")
-    structured = parse_statement_with_llm(extracted)
+    graph = StateGraph(AgentState)
+    graph.add_node("pdf_extractor", pdf_extractor)
+    graph.add_node("text_flattener", text_flattener)
+    graph.add_node("statement_parser", partial(statement_parser, llm_fn=openai_llm))
 
-    print(structured)
+    graph.add_edge(START, "pdf_extractor")
+    graph.add_edge("pdf_extractor", "text_flattener")
+    graph.add_edge("text_flattener", "statement_parser")
+    graph.add_edge("statement_parser", END)
+
+    pipeline = graph.compile()
+    result = pipeline.invoke({"pdf_path": "statements/april-2025.pdf"})
+    print(json.dumps(result["parsed_data"], indent=2, ensure_ascii=False))
 
