@@ -25,3 +25,6 @@ CREATE TABLE IF NOT EXISTS transactions (
     amount NUMERIC(15, 2),
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE statements ADD CONSTRAINT unique_statement
+    UNIQUE (account_holder, account_name, start_date, end_date);
