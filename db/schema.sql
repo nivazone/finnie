@@ -28,3 +28,5 @@ CREATE TABLE IF NOT EXISTS transactions (
 
 ALTER TABLE statements ADD CONSTRAINT unique_statement
     UNIQUE (account_holder, account_name, start_date, end_date);
+
+ALTER TABLE transactions ADD COLUMN category TEXT;
