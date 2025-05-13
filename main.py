@@ -351,6 +351,7 @@ if __name__ == "__main__":
     # PILImage.open(BytesIO(png_bytes)).show()
 
     result = pipeline.invoke({
+        "messages": [HumanMessage(content="Start of pipeline")],
         "pdf_path": "statements/april-2025.pdf",
         "categories": [
             "Groceries", 
@@ -362,5 +363,6 @@ if __name__ == "__main__":
             "Other"
         ]
     })
+    
     print("Pipeline completed. DB should be populated.")
 
