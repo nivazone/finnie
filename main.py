@@ -18,6 +18,7 @@ from io import BytesIO
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.runnables.graph_mermaid import MermaidDrawMethod
 from langchain_core.messages import HumanMessage
+from langfuse.callback import CallbackHandler
 
 
 # ------------------------------------------------
@@ -53,28 +54,6 @@ def get_db_connection() -> Connection:
         user=os.getenv("POSTGRES_USER"),
         password=os.getenv("POSTGRES_PASSWORD"),
     )
-
-# def get_openai_llm(prompt: str) -> str:
-#     """
-#     Calls OpenAI LLM to generate a response for a given prompt.
-
-#     Args:
-#         prompt (str): Prompt text to send to the model.
-
-#     Returns:
-#         str: Text response from the LLM.
-#     """
-
-#     client = OpenAI(
-#         base_url=os.getenv("OPENAI_BASE_URL", None),
-#         api_key=os.getenv("OPENAI_API_KEY", "lm-studio")
-#     )
-#     response = client.chat.completions.create(
-#         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-#         messages=[{"role": "user", "content": prompt}],
-#         temperature=0.0
-#     )
-#     return response.choices[0].message.content.strip()
 
 # ------------------------------------------------
 # Agent: PDF extractor
@@ -305,6 +284,7 @@ def transaction_classifier(state: AgentState, db_fn: Callable[[], Connection], l
             for tx_id, details in transactions:
                 msg = f"{prompt}\n\nTransaction: \"{details}\""
                 response = llm_fn([HumanMessage(content=msg)])
+
                 category = response.content
                 cur.execute("""
                     UPDATE transactions SET category = %s WHERE id = %s
@@ -312,19 +292,20 @@ def transaction_classifier(state: AgentState, db_fn: Callable[[], Connection], l
         conn.commit()
     return state
 
-
 if __name__ == "__main__":
     load_dotenv()
     logging.getLogger("pdfminer").setLevel(logging.ERROR)
+    langfuse_handler = CallbackHandler()
 
-    llm = ChatOpenAI(
+    web_search_tool = TavilySearch(max_results=3)
+    tools = [web_search_tool]
+    client = ChatOpenAI(
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         base_url=os.getenv("OPENAI_BASE_URL", None),
         api_key=os.getenv("OPENAI_API_KEY", None),
         temperature=0
     )
-
-    web_search_tool = TavilySearch(max_results=3)
+    llm = client.bind_tools(tools)    
     
     graph = StateGraph(AgentState)
     graph.add_node("pdf_extractor", pdf_extractor)
@@ -332,8 +313,7 @@ if __name__ == "__main__":
     graph.add_node("statement_parser", partial(statement_parser, llm_fn=llm.invoke))
     graph.add_node("postgres_writer", partial(postgres_writer, db_fn=get_db_connection))
     graph.add_node("transaction_classifier", partial(transaction_classifier, db_fn=get_db_connection, llm_fn=llm.invoke))
-    graph.add_node("tools", ToolNode([web_search_tool]))
-
+    graph.add_node("tools", ToolNode(tools))
 
     graph.add_edge(START, "pdf_extractor")
     graph.add_edge("pdf_extractor", "text_flattener")
@@ -342,13 +322,9 @@ if __name__ == "__main__":
     graph.add_edge("postgres_writer", "transaction_classifier")
     graph.add_conditional_edges("transaction_classifier", tools_condition)
     graph.add_edge("tools", "transaction_classifier")
+    graph.add_edge("transaction_classifier", END)
 
     pipeline = graph.compile()
-    
-    # png_bytes = pipeline.get_graph(xray=True).draw_mermaid_png(
-    #     draw_method=MermaidDrawMethod.PYPPETEER
-    # )
-    # PILImage.open(BytesIO(png_bytes)).show()
 
     result = pipeline.invoke({
         "messages": [HumanMessage(content="Start of pipeline")],
@@ -359,9 +335,12 @@ if __name__ == "__main__":
             "Utilities", 
             "Insurance",
             "Entertainment", 
-            "Subscriptions", 
+            "Subscriptions",
+            "Healthcare",
             "Other"
         ]
+    }, config={
+        "callbacks": [langfuse_handler]
     })
     
     print("Pipeline completed. DB should be populated.")
