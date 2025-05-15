@@ -222,9 +222,13 @@ def postgres_writer(state: AgentState, db_fn: Callable[[], Connection]) -> Agent
 # ------------------------------------------------
 # Agent: Transaction Classifier
 # ------------------------------------------------
-def transaction_classifier(state: AgentState, db_fn: Callable[[], Connection], llm_fn: Callable[[list[AnyMessage]], AnyMessage]) -> AgentState:
+def transaction_classifier(
+    state: AgentState,
+    db_fn: Callable[[], Connection],
+    llm_fn: Callable[[list[AnyMessage]], AnyMessage]
+) -> AgentState:
     """
-    Classifies transactions into spending categories using LLM + tools.
+    Classifies transactions into spending categories using LLM + structured JSON output.
     Updates transactions table with predicted category.
 
     Args:
@@ -237,7 +241,7 @@ def transaction_classifier(state: AgentState, db_fn: Callable[[], Connection], l
     """
 
     print("[Agent] Starting transaction_classifier...")
-    
+
     parsed = state["parsed_data"]
     account_holder = parsed.get("account_holder")
     account_name = parsed.get("account_name")
@@ -247,18 +251,23 @@ def transaction_classifier(state: AgentState, db_fn: Callable[[], Connection], l
     categories_str = ", ".join(categories)
 
     prompt = f"""
-        You are a financial transaction classification agent. 
-        You can call external tools if you are unsure about a merchant or transaction.
-
-        You MUST classify each transaction into ONE of the following categories:
+        You are a financial transaction classification agent.
+        You must classify each transaction into ONE of the following categories:
         {categories_str}
 
         Instructions:
-        - If you are confident from the transaction text alone, classify directly.
-        - If you are unsure about the merchant or transaction, call the web_search_tool first.
-        - After using the tool, output ONLY the category name. Do NOT explain.
-        - Never say "I am an AI model", "Based on my knowledge", or anything else.
-        - Your response must be ONLY the category name, matching exactly one of the allowed categories.
+            - You MUST output a valid raw JSON object (no markdown formatting, no extra text).
+            - Your JSON must have these fields:
+                - "category": the final classification, one of the categories list
+                - "search_results": any information found about the merchant (or leave as "" if not applicable)
+                - "reason": a short explanation of why you classified this way
+
+        Example:
+        {{
+            "category": "Groceries",
+            "search_results": "Coles supermarket Australia",
+            "reason": "Merchant name matches known supermarket"
+        }}
 
         Here is the transaction you must classify:
         """
@@ -271,6 +280,7 @@ def transaction_classifier(state: AgentState, db_fn: Callable[[], Connection], l
                 AND start_date = %s AND end_date = %s
             """, (account_holder, account_name, start_date, end_date))
             result = cur.fetchone()
+            
             if not result:
                 raise Exception("Statement not found.")
             statement_id = result[0]
@@ -282,14 +292,29 @@ def transaction_classifier(state: AgentState, db_fn: Callable[[], Connection], l
             transactions = cur.fetchall()
 
             for tx_id, details in transactions:
-                msg = f"{prompt}\n\nTransaction: \"{details}\""
-                response = llm_fn([HumanMessage(content=msg)])
+                full_prompt = f"{prompt}\n\nTransaction: \"{details}\""
+                response = llm_fn([HumanMessage(content=full_prompt)])
 
-                category = response.content
+                try:
+                    result_json = json.loads(response.content.strip())
+                    category = result_json["category"]
+                    search_results = result_json["search_results"]
+                    reason = result_json["reason"]
+
+                    print(f"[LLM Classification] category: {category}, search_results: {search_results}, reason: {reason}")
+
+                except Exception as e:
+                    print("[ERROR] Failed to parse LLM response as JSON:", e)
+                    print("[Full prompt]", full_prompt)
+                    print("[Response content]:", response)
+                    category = "Unknown"
+
                 cur.execute("""
                     UPDATE transactions SET category = %s WHERE id = %s
                 """, (category.strip(), tx_id))
+
         conn.commit()
+
     return state
 
 if __name__ == "__main__":
@@ -299,13 +324,12 @@ if __name__ == "__main__":
 
     web_search_tool = TavilySearch(max_results=3)
     tools = [web_search_tool]
-    client = ChatOpenAI(
+    llm = ChatOpenAI(
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         base_url=os.getenv("OPENAI_BASE_URL", None),
         api_key=os.getenv("OPENAI_API_KEY", None),
         temperature=0
-    )
-    llm = client.bind_tools(tools)    
+    ) 
     
     graph = StateGraph(AgentState)
     graph.add_node("pdf_extractor", pdf_extractor)
@@ -337,7 +361,7 @@ if __name__ == "__main__":
             "Entertainment", 
             "Subscriptions",
             "Healthcare",
-            "Other"
+            "Unknown"
         ]
     }, config={
         "callbacks": [langfuse_handler]
